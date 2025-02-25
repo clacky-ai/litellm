@@ -76,9 +76,7 @@ def make_sync_call(
     timeout: Optional[Union[float, httpx.Timeout]] = None,
 ):
     if client is None:
-        client = AsyncHTTPHandler(
-            timeout=600.0, client_alias="module level aclient"
-        )
+        client = litellm.module_level_client
 
     response = client.post(
         api_base, headers=headers, data=data, stream=not fake_stream, timeout=timeout
@@ -183,7 +181,9 @@ class OpenAILikeChatHandler(OpenAILikeBase):
             timeout = httpx.Timeout(timeout=600.0, connect=5.0)
 
         if client is None:
-            client = litellm.module_level_aclient
+            client = AsyncHTTPHandler(
+                timeout=600.0, client_alias="module level aclient"
+            )
 
         try:
             response = await client.post(
