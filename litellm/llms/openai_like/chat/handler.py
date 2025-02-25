@@ -76,7 +76,9 @@ def make_sync_call(
     timeout: Optional[Union[float, httpx.Timeout]] = None,
 ):
     if client is None:
-        client = litellm.module_level_client  # Create a new client if none provided
+        client = AsyncHTTPHandler(
+            timeout=600.0, client_alias="module level aclient"
+        )
 
     response = client.post(
         api_base, headers=headers, data=data, stream=not fake_stream, timeout=timeout
