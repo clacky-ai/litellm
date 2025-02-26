@@ -672,9 +672,9 @@ def get_async_httpx_client(
                 pass
 
     _cache_key_name = "async_httpx_client" + _params_key_name + llm_provider
-    _cached_client = litellm.in_memory_llm_clients_cache.get_cache(_cache_key_name)
-    if _cached_client:
-        return _cached_client
+    # _cached_client = litellm.in_memory_llm_clients_cache.get_cache(_cache_key_name)
+    # if _cached_client:
+    #     return _cached_client
 
     if params is not None:
         _new_client = AsyncHTTPHandler(**params)
