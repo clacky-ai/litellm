@@ -219,7 +219,10 @@ class BedrockConverseLLM(BaseAWSLLM):
                 params=_params, llm_provider=litellm.LlmProviders.BEDROCK
             )
         else:
-            client = client  # type: ignore
+            # client = client  # type: ignore
+            client = get_async_httpx_client(
+                llm_provider=litellm.LlmProviders.BEDROCK
+            )
 
         try:
             response = await client.post(

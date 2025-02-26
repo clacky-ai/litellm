@@ -671,7 +671,7 @@ def get_async_httpx_client(
             except Exception:
                 pass
 
-    _cache_key_name = "async_httpx_client" + _params_key_name + llm_provider
+    # _cache_key_name = "async_httpx_client" + _params_key_name + llm_provider
     # _cached_client = litellm.in_memory_llm_clients_cache.get_cache(_cache_key_name)
     # if _cached_client:
     #     return _cached_client
@@ -683,11 +683,11 @@ def get_async_httpx_client(
             timeout=httpx.Timeout(timeout=600.0, connect=5.0)
         )
 
-    litellm.in_memory_llm_clients_cache.set_cache(
-        key=_cache_key_name,
-        value=_new_client,
-        ttl=_DEFAULT_TTL_FOR_HTTPX_CLIENTS,
-    )
+    # litellm.in_memory_llm_clients_cache.set_cache(
+    #     key=_cache_key_name,
+    #     value=_new_client,
+    #     ttl=_DEFAULT_TTL_FOR_HTTPX_CLIENTS,
+    # )
     return _new_client
 
 
