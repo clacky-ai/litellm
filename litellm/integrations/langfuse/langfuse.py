@@ -684,6 +684,10 @@ class LangFuseLogger:
 
                 if _usage_obj:
                     usage = {
+                        "input": _usage_obj.prompt_tokens - getattr(_usage_obj, "cache_read_input_tokens", 0),
+                        "output": _usage_obj.completion_tokens,
+                        "cache_read_input_tokens": getattr(_usage_obj, "cache_read_input_tokens", 0),
+                        "cache_creation_input_tokens": getattr(_usage_obj, "cache_creation_input_tokens", 0),
                         "prompt_tokens": _usage_obj.prompt_tokens,
                         "completion_tokens": _usage_obj.completion_tokens,
                         "total_cost": cost if self._supports_costs() else None,
