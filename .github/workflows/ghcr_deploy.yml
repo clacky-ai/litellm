@@ -30,7 +30,7 @@ jobs:
           echo "Tag: ${{ github.event.inputs.tag }}"
           echo "Release type: ${{ github.event.inputs.release_type }}"
   docker-hub-deploy:
-    if: github.repository == 'BerriAI/litellm'
+    if: github.repository == 'clacky-ai/litellm'
     runs-on: ubuntu-latest
     steps:
       -
@@ -121,9 +121,9 @@ jobs:
           tags: |
             ${{ steps.meta.outputs.tags }}-${{ github.event.inputs.tag || 'latest' }},
             ${{ steps.meta.outputs.tags }}-${{ github.event.inputs.release_type }}
-            ${{ (github.event.inputs.release_type == 'stable'  || github.event.inputs.release_type == 'rc') && format('{0}/berriai/litellm:main-{1}', env.REGISTRY, github.event.inputs.tag) || '' }},
-            ${{ github.event.inputs.release_type == 'stable' && format('{0}/berriai/litellm:main-stable', env.REGISTRY) || '' }},
-            ${{ (github.event.inputs.release_type == 'stable'  || github.event.inputs.release_type == 'rc') && format('{0}/berriai/litellm:{1}', env.REGISTRY, github.event.inputs.tag) || '' }},
+            ${{ (github.event.inputs.release_type == 'stable'  || github.event.inputs.release_type == 'rc') && format('{0}/clacky-ai/litellm:main-{1}', env.REGISTRY, github.event.inputs.tag) || '' }},
+            ${{ github.event.inputs.release_type == 'stable' && format('{0}/clacky-ai/litellm:main-stable', env.REGISTRY) || '' }},
+            ${{ (github.event.inputs.release_type == 'stable'  || github.event.inputs.release_type == 'rc') && format('{0}/clacky-ai/litellm:{1}', env.REGISTRY, github.event.inputs.tag) || '' }},
           labels: ${{ steps.meta.outputs.labels }}
           platforms: local,linux/amd64,linux/arm64,linux/arm64/v8
   
@@ -165,8 +165,8 @@ jobs:
           tags: |
             ${{ steps.meta-ee.outputs.tags }}-${{ github.event.inputs.tag || 'latest' }},
             ${{ steps.meta-ee.outputs.tags }}-${{ github.event.inputs.release_type }}
-            ${{ (github.event.inputs.release_type == 'stable'  || github.event.inputs.release_type == 'rc') && format('{0}/berriai/litellm-ee:main-{1}', env.REGISTRY, github.event.inputs.tag) || '' }},
-            ${{ github.event.inputs.release_type == 'stable' && format('{0}/berriai/litellm-ee:main-stable', env.REGISTRY) || '' }}
+            ${{ (github.event.inputs.release_type == 'stable'  || github.event.inputs.release_type == 'rc') && format('{0}/clacky-ai/litellm-ee:main-{1}', env.REGISTRY, github.event.inputs.tag) || '' }},
+            ${{ github.event.inputs.release_type == 'stable' && format('{0}/clacky-ai/litellm-ee:main-stable', env.REGISTRY) || '' }}
           labels: ${{ steps.meta-ee.outputs.labels }}
           platforms: local,linux/amd64,linux/arm64,linux/arm64/v8
    
@@ -208,8 +208,8 @@ jobs:
           tags: |
             ${{ steps.meta-database.outputs.tags }}-${{ github.event.inputs.tag || 'latest' }},
             ${{ steps.meta-database.outputs.tags }}-${{ github.event.inputs.release_type }}
-            ${{ (github.event.inputs.release_type == 'stable'  || github.event.inputs.release_type == 'rc') && format('{0}/berriai/litellm-database:main-{1}', env.REGISTRY, github.event.inputs.tag) || '' }},
-            ${{ github.event.inputs.release_type == 'stable' && format('{0}/berriai/litellm-database:main-stable', env.REGISTRY) || '' }}
+            ${{ (github.event.inputs.release_type == 'stable'  || github.event.inputs.release_type == 'rc') && format('{0}/clacky-ai/litellm-database:main-{1}', env.REGISTRY, github.event.inputs.tag) || '' }},
+            ${{ github.event.inputs.release_type == 'stable' && format('{0}/clacky-ai/litellm-database:main-stable', env.REGISTRY) || '' }}
           labels: ${{ steps.meta-database.outputs.labels }}
           platforms: local,linux/amd64,linux/arm64,linux/arm64/v8
             
@@ -251,8 +251,8 @@ jobs:
           tags: |
             ${{ steps.meta-non_root.outputs.tags }}-${{ github.event.inputs.tag || 'latest' }},
             ${{ steps.meta-non_root.outputs.tags }}-${{ github.event.inputs.release_type }}
-            ${{ (github.event.inputs.release_type == 'stable'  || github.event.inputs.release_type == 'rc') && format('{0}/berriai/litellm-non_root:main-{1}', env.REGISTRY, github.event.inputs.tag) || '' }},
-            ${{ github.event.inputs.release_type == 'stable' && format('{0}/berriai/litellm-non_root:main-stable', env.REGISTRY) || '' }}
+            ${{ (github.event.inputs.release_type == 'stable'  || github.event.inputs.release_type == 'rc') && format('{0}/clacky-ai/litellm-non_root:main-{1}', env.REGISTRY, github.event.inputs.tag) || '' }},
+            ${{ github.event.inputs.release_type == 'stable' && format('{0}/clacky-ai/litellm-non_root:main-stable', env.REGISTRY) || '' }}
           labels: ${{ steps.meta-non_root.outputs.labels }} 
           platforms: local,linux/amd64,linux/arm64,linux/arm64/v8
   
@@ -294,8 +294,8 @@ jobs:
           tags: |
             ${{ steps.meta-spend-logs.outputs.tags }}-${{ github.event.inputs.tag || 'latest' }},
             ${{ steps.meta-spend-logs.outputs.tags }}-${{ github.event.inputs.release_type }}
-            ${{ (github.event.inputs.release_type == 'stable'  || github.event.inputs.release_type == 'rc') && format('{0}/berriai/litellm-spend_logs:main-{1}', env.REGISTRY, github.event.inputs.tag) || '' }},
-            ${{ github.event.inputs.release_type == 'stable' && format('{0}/berriai/litellm-spend_logs:main-stable', env.REGISTRY) || '' }}
+            ${{ (github.event.inputs.release_type == 'stable'  || github.event.inputs.release_type == 'rc') && format('{0}/clacky-ai/litellm-spend_logs:main-{1}', env.REGISTRY, github.event.inputs.tag) || '' }},
+            ${{ github.event.inputs.release_type == 'stable' && format('{0}/clacky-ai/litellm-spend_logs:main-stable', env.REGISTRY) || '' }}
           platforms: local,linux/amd64,linux/arm64,linux/arm64/v8
 
   build-and-push-helm-chart:
