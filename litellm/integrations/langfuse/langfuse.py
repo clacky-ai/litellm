@@ -713,7 +713,6 @@ class LangFuseLogger:
                 "input": input if not mask_input else "redacted-by-litellm",
                 "output": output if not mask_output else "redacted-by-litellm",
                 "usage_details": usage,
-                "usage": usage,
                 "metadata": log_requester_metadata(clean_metadata),
                 "level": level,
                 "version": clean_metadata.pop("version", None),
@@ -737,7 +736,7 @@ class LangFuseLogger:
                 generation_params["completion_start_time"] = kwargs.get(
                     "completion_start_time", None
                 )
-
+            verbose_logger.debug(f"generation_params: {generation_params} for trace_id: {trace_id}")
             generation_client = trace.generation(**generation_params)
 
             return generation_client.trace_id, generation_id
