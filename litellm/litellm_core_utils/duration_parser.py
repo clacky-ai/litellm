@@ -1,7 +1,7 @@
 """
 Helper utilities for parsing durations - 1s, 1d, 10d, 30d, 1mo, 2mo
 
-duration_in_seconds is used in diff parts of the code base, example 
+duration_in_seconds is used in diff parts of the code base, example
 - Router - Provider budget routing
 - Proxy - Key, Team Generation
 """
@@ -138,6 +138,8 @@ def get_next_standardized_reset_time(
         return _handle_minute_reset(current_time, base_midnight, value)
     elif unit == "s":
         return _handle_second_reset(current_time, base_midnight, value)
+    elif unit == "mo":
+        return _handle_month_reset(current_time, base_midnight, value)
     else:
         # Unrecognized unit, default to next midnight
         return base_midnight + timedelta(days=1)
@@ -156,6 +158,7 @@ def _setup_timezone(
                 "US/Eastern": timezone(timedelta(hours=-4)),  # EDT
                 "US/Pacific": timezone(timedelta(hours=-7)),  # PDT
                 "Asia/Kolkata": timezone(timedelta(hours=5, minutes=30)),  # IST
+                "Asia/Bangkok": timezone(timedelta(hours=7)),  # ICT (Indochina Time)
                 "Europe/London": timezone(timedelta(hours=1)),  # BST
                 "UTC": timezone.utc,
             }
@@ -190,6 +193,10 @@ def _handle_day_reset(
     current_time: datetime, base_midnight: datetime, value: int, timezone: timezone
 ) -> datetime:
     """Handle day-based reset times."""
+    # Handle zero value - immediate expiration
+    if value == 0:
+        return current_time
+
     if value == 1:  # Daily reset at midnight
         return base_midnight + timedelta(days=1)
     elif value == 7:  # Weekly reset on Monday at midnight
@@ -232,6 +239,10 @@ def _handle_hour_reset(
     current_time: datetime, base_midnight: datetime, value: int
 ) -> datetime:
     """Handle hour-based reset times."""
+    # Handle zero value - immediate expiration
+    if value == 0:
+        return current_time
+
     current_hour = current_time.hour
     current_minute = current_time.minute
     current_second = current_time.second
@@ -264,6 +275,10 @@ def _handle_minute_reset(
     current_time: datetime, base_midnight: datetime, value: int
 ) -> datetime:
     """Handle minute-based reset times."""
+    # Handle zero value - immediate expiration
+    if value == 0:
+        return current_time
+
     current_hour = current_time.hour
     current_minute = current_time.minute
     current_second = current_time.second
@@ -304,6 +319,10 @@ def _handle_second_reset(
     current_time: datetime, base_midnight: datetime, value: int
 ) -> datetime:
     """Handle second-based reset times."""
+    # Handle zero value - immediate expiration
+    if value == 0:
+        return current_time
+
     current_hour = current_time.hour
     current_minute = current_time.minute
     current_second = current_time.second
@@ -342,4 +361,41 @@ def _handle_second_reset(
 
     return current_time.replace(
         hour=next_hour, minute=next_minute, second=next_second, microsecond=0
+    )
+
+
+def _handle_month_reset(
+    current_time: datetime, base_midnight: datetime, value: int
+) -> datetime:
+    """
+    Handle monthly reset times. For monthly resets, we always reset at the start of the next month.
+
+    Args:
+        current_time: Current datetime
+        base_midnight: Midnight of current day
+        value: Number of months (currently only supports 1 month resets)
+
+    Returns:
+        datetime: First day of next month at midnight
+    """
+    if value != 1:
+        raise ValueError("Monthly resets currently only support 1 month intervals")
+
+    # Get the first day of next month
+    if current_time.month == 12:
+        next_month = 1
+        next_year = current_time.year + 1
+    else:
+        next_month = current_time.month + 1
+        next_year = current_time.year
+
+    return datetime(
+        year=next_year,
+        month=next_month,
+        day=1,
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+        tzinfo=current_time.tzinfo,
     )

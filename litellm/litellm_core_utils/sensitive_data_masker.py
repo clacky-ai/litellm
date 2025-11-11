@@ -1,6 +1,6 @@
 from typing import Any, Dict, Optional, Set
 
-from litellm.constants import DEFAULT_MAX_RECURSE_DEPTH
+from litellm.constants import DEFAULT_MAX_RECURSE_DEPTH_SENSITIVE_DATA_MASKER
 
 
 class SensitiveDataMasker:
@@ -21,6 +21,8 @@ class SensitiveDataMasker:
             "access",
             "private",
             "certificate",
+            "fingerprint",
+            "tenancy",
         }
 
         self.visible_prefix = visible_prefix
@@ -33,18 +35,30 @@ class SensitiveDataMasker:
 
         value_str = str(value)
         masked_length = len(value_str) - (self.visible_prefix + self.visible_suffix)
-        return f"{value_str[:self.visible_prefix]}{self.mask_char * masked_length}{value_str[-self.visible_suffix:]}"
+
+        # Handle the case where visible_suffix is 0 to avoid showing the entire string
+        if self.visible_suffix == 0:
+            return f"{value_str[:self.visible_prefix]}{self.mask_char * masked_length}"
+        else:
+            return f"{value_str[:self.visible_prefix]}{self.mask_char * masked_length}{value_str[-self.visible_suffix:]}"
 
     def is_sensitive_key(self, key: str) -> bool:
         key_lower = str(key).lower()
-        result = any(pattern in key_lower for pattern in self.sensitive_patterns)
+        # Split on underscores and check if any segment matches the pattern
+        # This avoids false positives like "max_tokens" matching "token"
+        # but still catches "api_key", "access_token", etc.
+        key_segments = key_lower.replace('-', '_').split('_')
+        result = any(
+            pattern in key_segments
+            for pattern in self.sensitive_patterns
+        )
         return result
 
     def mask_dict(
         self,
         data: Dict[str, Any],
         depth: int = 0,
-        max_depth: int = DEFAULT_MAX_RECURSE_DEPTH,
+        max_depth: int = DEFAULT_MAX_RECURSE_DEPTH_SENSITIVE_DATA_MASKER,
     ) -> Dict[str, Any]:
         if depth >= max_depth:
             return data
@@ -61,7 +75,7 @@ class SensitiveDataMasker:
                     masked_data[k] = self._mask_value(str_value)
                 else:
                     masked_data[k] = (
-                        v if isinstance(v, (int, float, bool, str)) else str(v)
+                        v if isinstance(v, (int, float, bool, str, list)) else str(v)
                     )
             except Exception:
                 masked_data[k] = "<unable to serialize>"
@@ -75,12 +89,14 @@ masker = SensitiveDataMasker()
 data = {
     "api_key": "sk-1234567890abcdef",
     "redis_password": "very_secret_pass",
-    "port": 6379
+    "port": 6379,
+    "tags": ["East US 2", "production", "test"]
 }
 masked = masker.mask_dict(data)
 # Result: {
 #    "api_key": "sk-1****cdef",
 #    "redis_password": "very****pass",
-#    "port": 6379
+#    "port": 6379,
+#    "tags": ["East US 2", "production", "test"]
 # }
 """

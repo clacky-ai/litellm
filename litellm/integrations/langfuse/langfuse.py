@@ -1,6 +1,5 @@
 #### What this does ####
 #    On success, logs events to Langfuse
-import copy
 import os
 import traceback
 from datetime import datetime
@@ -10,11 +9,13 @@ from packaging.version import Version
 
 import litellm
 from litellm._logging import verbose_logger
+from litellm.constants import MAX_LANGFUSE_INITIALIZED_CLIENTS
+from litellm.litellm_core_utils.core_helpers import safe_deep_copy
 from litellm.litellm_core_utils.redact_messages import redact_user_api_key_info
 from litellm.llms.custom_httpx.http_handler import _get_httpx_client
 from litellm.secret_managers.main import str_to_bool
 from litellm.types.integrations.langfuse import *
-from litellm.types.llms.openai import HttpxBinaryResponseContent
+from litellm.types.llms.openai import HttpxBinaryResponseContent, ResponsesAPIResponse
 from litellm.types.utils import (
     EmbeddingResponse,
     ImageResponse,
@@ -27,9 +28,13 @@ from litellm.types.utils import (
 )
 
 if TYPE_CHECKING:
+    from langfuse.client import Langfuse, StatefulTraceClient
+
     from litellm.litellm_core_utils.litellm_logging import DynamicLoggingCache
 else:
     DynamicLoggingCache = Any
+    StatefulTraceClient = Any
+    Langfuse = Any
 
 
 class LangFuseLogger:
@@ -81,8 +86,7 @@ class LangFuseLogger:
 
         if Version(self.langfuse_sdk_version) >= Version("2.6.0"):
             parameters["sdk_integration"] = "litellm"
-
-        self.Langfuse = Langfuse(**parameters)
+        self.Langfuse: Langfuse = self.safe_init_langfuse_client(parameters)
 
         # set the current langfuse project id in the environ
         # this is used by Alerting to link to the correct project
@@ -120,6 +124,27 @@ class LangFuseLogger:
             )
         else:
             self.upstream_langfuse = None
+
+    def safe_init_langfuse_client(self, parameters: dict) -> Langfuse:
+        """
+        Safely init a langfuse client if the number of initialized clients is less than the max
+
+        Note:
+            - Langfuse initializes 1 thread everytime a client is initialized.
+            - We've had an incident in the past where we reached 100% cpu utilization because Langfuse was initialized several times.
+        """
+        from langfuse import Langfuse
+
+        if litellm.initialized_langfuse_clients >= MAX_LANGFUSE_INITIALIZED_CLIENTS:
+            raise Exception(
+                f"Max langfuse clients reached: {litellm.initialized_langfuse_clients} is greater than {MAX_LANGFUSE_INITIALIZED_CLIENTS}"
+            )
+        langfuse_client = Langfuse(**parameters)
+        litellm.initialized_langfuse_clients += 1
+        verbose_logger.debug(
+            f"Created langfuse client number {litellm.initialized_langfuse_clients}"
+        )
+        return langfuse_client
 
     @staticmethod
     def add_metadata_from_header(litellm_params: dict, metadata: dict) -> dict:
@@ -171,6 +196,7 @@ class LangFuseLogger:
             TranscriptionResponse,
             RerankResponse,
             HttpxBinaryResponseContent,
+            ResponsesAPIResponse,
         ],
         start_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
@@ -196,7 +222,7 @@ class LangFuseLogger:
                 litellm_params.get("metadata", {}) or {}
             )  # if litellm_params['metadata'] == None
             metadata = self.add_metadata_from_header(litellm_params, metadata)
-            optional_params = copy.deepcopy(kwargs.get("optional_params", {}))
+            optional_params = safe_deep_copy(kwargs.get("optional_params", {}))
 
             prompt = {"messages": kwargs.get("messages")}
 
@@ -280,6 +306,7 @@ class LangFuseLogger:
             TranscriptionResponse,
             RerankResponse,
             HttpxBinaryResponseContent,
+            ResponsesAPIResponse,
         ],
         prompt: dict,
         level: str,
@@ -344,6 +371,11 @@ class LangFuseLogger:
         ):
             input = prompt
             output = response_obj.results
+        elif response_obj is not None and isinstance(
+            response_obj, litellm.ResponsesAPIResponse
+        ):
+            input = prompt
+            output = self._get_responses_api_content_for_langfuse(response_obj)
         elif (
             kwargs.get("call_type") is not None
             and kwargs.get("call_type") == "_arealtime"
@@ -626,18 +658,20 @@ class LangFuseLogger:
                         if key.lower() not in ["authorization", "cookie", "referer"]:
                             clean_headers[key] = value
 
-                # clean_metadata["request"] = {
-                #     "method": method,
-                #     "url": url,
-                #     "headers": clean_headers,
-                # }
-            trace = self.Langfuse.trace(**trace_params)
+            trace: StatefulTraceClient = self.Langfuse.trace(**trace_params)
 
             # Log provider specific information as a span
             log_provider_specific_information_as_span(trace, clean_metadata)
 
+            # Log guardrail information as a span
+            self._log_guardrail_information_as_span(
+                trace=trace,
+                standard_logging_object=standard_logging_object,
+            )
+
             generation_id = None
             usage = None
+            usage_details = None
             if response_obj is not None:
                 if (
                     hasattr(response_obj, "id")
@@ -649,12 +683,46 @@ class LangFuseLogger:
                 _usage_obj = getattr(response_obj, "usage", None)
 
                 if _usage_obj:
+                    # Read cache_read_input_tokens - support both legacy and new formats
+                    # Legacy format (Anthropic, etc): top-level cache_read_input_tokens
+                    # New format (OpenAI, OpenRouter): prompt_tokens_details.cached_tokens
+                    cache_read_input_tokens = _usage_obj.get(
+                        "cache_read_input_tokens", 0
+                    )
+                    if cache_read_input_tokens == 0:
+                        # Try reading from prompt_tokens_details.cached_tokens (OpenAI format)
+                        prompt_tokens_details = _usage_obj.get("prompt_tokens_details", {})
+                        if isinstance(prompt_tokens_details, dict):
+                            cache_read_input_tokens = prompt_tokens_details.get("cached_tokens", 0) or 0
+
+                    # Read cache_creation_input_tokens - support both formats
+                    cache_creation_input_tokens = _usage_obj.get(
+                        "cache_creation_input_tokens", 0
+                    )
+                    if cache_creation_input_tokens == 0:
+                        # Try reading from prompt_tokens_details.cache_creation_tokens (OpenAI format)
+                        prompt_tokens_details = _usage_obj.get("prompt_tokens_details", {})
+                        if isinstance(prompt_tokens_details, dict):
+                            cache_creation_input_tokens = prompt_tokens_details.get("cache_creation_tokens", 0) or 0
+
                     usage = {
-                        "input": _usage_obj.prompt_tokens - getattr(_usage_obj, "cache_read_input_tokens", 0),
+                        "input": _usage_obj.prompt_tokens - cache_read_input_tokens,
                         "output": _usage_obj.completion_tokens,
-                        "cache_read_input_tokens": getattr(_usage_obj, "cache_read_input_tokens", 0),
-                        "cache_creation_input_tokens": getattr(_usage_obj, "cache_creation_input_tokens", 0),
+                        "cache_read_input_tokens": cache_read_input_tokens,
+                        "cache_creation_input_tokens": cache_creation_input_tokens,
                     }
+
+                    # According to langfuse documentation: "the input value must be reduced by the number of cache_read_input_tokens"
+                    input_tokens = _usage_obj.prompt_tokens - cache_read_input_tokens
+
+                    usage_details = LangfuseUsageDetails(
+                        input=input_tokens,
+                        output=_usage_obj.completion_tokens,
+                        total=_usage_obj.total_tokens,
+                        cache_creation_input_tokens=cache_creation_input_tokens,
+                        cache_read_input_tokens=cache_read_input_tokens,
+                    )
+
             generation_name = clean_metadata.pop("generation_name", None)
             if generation_name is None:
                 # if `generation_name` is None, use sensible default values
@@ -686,7 +754,8 @@ class LangFuseLogger:
                 "model_parameters": optional_params,
                 "input": input if not mask_input else "redacted-by-litellm",
                 "output": output if not mask_output else "redacted-by-litellm",
-                "usage_details": usage,
+                "usage": usage,
+                "usage_details": usage_details,
                 "metadata": log_requester_metadata(clean_metadata),
                 "level": level,
                 "version": clean_metadata.pop("version", None),
@@ -740,6 +809,19 @@ class LangFuseLogger:
         """
         if response_obj.choices and len(response_obj.choices) > 0:
             return response_obj.choices[0].text
+        else:
+            return None
+
+    @staticmethod
+    def _get_responses_api_content_for_langfuse(
+        response_obj: ResponsesAPIResponse,
+    ):
+        """
+        Get the responses API content for Langfuse logging
+        """
+        if hasattr(response_obj, "output") and response_obj.output:
+            # ResponsesAPIResponse.output is a list of strings
+            return response_obj.output
         else:
             return None
 
@@ -809,6 +891,62 @@ class LangFuseLogger:
             [int] The flush interval to use to initialize the Langfuse client
         """
         return int(os.getenv("LANGFUSE_FLUSH_INTERVAL") or flush_interval)
+
+    def _log_guardrail_information_as_span(
+        self,
+        trace: StatefulTraceClient,
+        standard_logging_object: Optional[StandardLoggingPayload],
+    ):
+        """
+        Log guardrail information as a span
+        """
+        if standard_logging_object is None:
+            verbose_logger.debug(
+                "Not logging guardrail information as span because standard_logging_object is None"
+            )
+            return
+
+        guardrail_information = standard_logging_object.get(
+            "guardrail_information", None
+        )
+        if not guardrail_information:
+            verbose_logger.debug(
+                "Not logging guardrail information as span because guardrail_information is empty"
+            )
+            return
+
+        if not isinstance(guardrail_information, list):
+            verbose_logger.debug(
+                "Not logging guardrail information as span because guardrail_information is not a list: %s",
+                type(guardrail_information),
+            )
+            return
+
+        for guardrail_entry in guardrail_information:
+            if not isinstance(guardrail_entry, dict):
+                verbose_logger.debug(
+                    "Skipping guardrail entry with unexpected type: %s",
+                    type(guardrail_entry),
+                )
+                continue
+
+            span = trace.span(
+                name="guardrail",
+                input=guardrail_entry.get("guardrail_request", None),
+                output=guardrail_entry.get("guardrail_response", None),
+                metadata={
+                    "guardrail_name": guardrail_entry.get("guardrail_name", None),
+                    "guardrail_mode": guardrail_entry.get("guardrail_mode", None),
+                    "guardrail_masked_entity_count": guardrail_entry.get(
+                        "masked_entity_count", None
+                    ),
+                },
+                start_time=guardrail_entry.get("start_time", None),  # type: ignore
+                end_time=guardrail_entry.get("end_time", None),  # type: ignore
+            )
+
+            verbose_logger.debug(f"Logged guardrail information as span: {span}")
+            span.end()
 
 
 def _add_prompt_to_generation_params(

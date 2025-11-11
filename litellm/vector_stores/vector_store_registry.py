@@ -4,8 +4,10 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from litellm._logging import verbose_logger
+from litellm.litellm_core_utils.core_helpers import remove_items_at_indices
 from litellm.types.vector_stores import (
     LiteLLM_ManagedVectorStore,
+    LiteLLM_ManagedVectorStoreIndex,
     LiteLLM_ManagedVectorStoreListResponse,
     LiteLLM_VectorStoreConfig,
 )
@@ -14,6 +16,91 @@ if TYPE_CHECKING:
     from litellm.proxy.utils import PrismaClient
 else:
     PrismaClient = Any
+
+
+class VectorStoreIndexRegistry:
+    def __init__(
+        self, vector_store_indexes: List[LiteLLM_ManagedVectorStoreIndex] = []
+    ):
+        self.vector_store_indexes: List[LiteLLM_ManagedVectorStoreIndex] = (
+            vector_store_indexes
+        )
+
+    def get_vector_store_indexes(self) -> List[LiteLLM_ManagedVectorStoreIndex]:
+        """
+        Returns the vector store indexes
+        """
+        return self.vector_store_indexes
+
+    def get_vector_store_index_by_name(
+        self, vector_store_index_name: str
+    ) -> Optional[LiteLLM_ManagedVectorStoreIndex]:
+        """
+        Returns the vector store index by name
+        """
+        for vector_store_index in self.vector_store_indexes:
+            if vector_store_index.index_name == vector_store_index_name:
+                return vector_store_index
+        return None
+
+    def upsert_vector_store_index(
+        self, vector_store_index: LiteLLM_ManagedVectorStoreIndex
+    ):
+        """
+        Adds a vector store index to the registry.
+
+        If it already exists, it will be updated.
+        """
+        for i, _vector_store_index in enumerate[LiteLLM_ManagedVectorStoreIndex](
+            self.vector_store_indexes
+        ):
+            if _vector_store_index.index_name == vector_store_index.index_name:
+                self.vector_store_indexes[i] = vector_store_index
+                return
+        self.vector_store_indexes.append(vector_store_index)
+
+    def delete_vector_store_index(self, vector_store_index: str):
+        """
+        Deletes a vector store index from the registry
+        """
+        self.vector_store_indexes = [
+            index for index in self.vector_store_indexes if index != vector_store_index
+        ]
+
+    def is_vector_store_index(self, vector_store_index_name: str) -> bool:
+        """
+        Returns True if the vector store index is in the registry
+        """
+        for vector_store_index in self.vector_store_indexes:
+            if vector_store_index.index_name == vector_store_index_name:
+                return True
+        return False
+
+    #########################################################
+    ########### DB management helpers for vector stores ###########
+    #########################################################
+
+    @staticmethod
+    async def _get_vector_store_indexes_from_db(
+        prisma_client: Optional[PrismaClient],
+    ) -> List[LiteLLM_ManagedVectorStoreIndex]:
+        """
+        Get vector stores from the database
+        """
+        vector_stores_from_db: List[LiteLLM_ManagedVectorStoreIndex] = []
+        if prisma_client is not None:
+            _vector_stores_from_db = (
+                await prisma_client.db.litellm_managedvectorstoreindextable.find_many(
+                    order={"created_at": "desc"},
+                )
+            )
+            for vector_store in _vector_stores_from_db:
+                _dict_vector_store = dict(vector_store)
+                _litellm_managed_vector_store = LiteLLM_ManagedVectorStoreIndex(
+                    **_dict_vector_store
+                )
+                vector_stores_from_db.append(_litellm_managed_vector_store)
+        return vector_stores_from_db
 
 
 class VectorStoreRegistry:
@@ -55,9 +142,49 @@ class VectorStoreRegistry:
         vector_store_ids = non_default_params.pop("vector_store_ids", None) or []
 
         # 2. check if vector_store_ids is provided as a tool in the request
-        vector_store_ids = self._get_vector_store_ids_from_tool_calls(
-            tools=tools, vector_store_ids=vector_store_ids
+        vector_store_ids = self.get_and_pop_recognised_vector_store_tools(
+            tools=tools,
+            vector_store_ids=vector_store_ids,
         )
+
+        return vector_store_ids
+
+    def get_and_pop_recognised_vector_store_tools(
+        self, tools: Optional[List[Dict]] = None, vector_store_ids: List[str] = []
+    ) -> List[str]:
+        """
+        Returns and pops the vector store ids from the tool calls
+
+        It only pops the recognised vector store tools from the tools list.
+
+        Args:
+            tools: The tools to pop the vector store ids from
+            vector_store_ids: The list of vector store IDs the user provided
+
+        Returns:
+            The vector store ids that were popped
+        """
+        if tools:
+            tools_to_remove: List[int] = []
+            for i, tool in enumerate(tools):
+                tool_vector_store_ids: List[str] = tool.get("vector_store_ids", [])
+                if len(tool_vector_store_ids) == 0:
+                    continue
+                # remove the tool if all vector_store_ids are recognised in the registry
+                recognised = all(
+                    any(vs.get("vector_store_id") == vs_id for vs in self.vector_stores)
+                    for vs_id in tool_vector_store_ids
+                )
+                if recognised:
+                    tools_to_remove.append(i)
+                    vector_store_ids.extend(tool_vector_store_ids)
+
+            # remove recognised tools from the original list
+            remove_items_at_indices(
+                items=tools,
+                indices=tools_to_remove,
+            )
+
         return vector_store_ids
 
     def get_vector_store_to_run(
@@ -86,6 +213,46 @@ class VectorStoreRegistry:
                 if vector_store.get("vector_store_id") == vector_store_id:
                     return vector_store
         return None
+
+    def get_litellm_managed_vector_store_from_registry(
+        self, vector_store_id: str
+    ) -> Optional[LiteLLM_ManagedVectorStore]:
+        """
+        Returns the vector store from the registry
+        """
+        for vector_store in self.vector_stores:
+            if vector_store.get("vector_store_id") == vector_store_id:
+                return vector_store
+        return None
+
+    def get_litellm_managed_vector_store_from_registry_by_name(
+        self, vector_store_name: str
+    ) -> Optional[LiteLLM_ManagedVectorStore]:
+        """
+        Returns the vector store from the registry by name
+        """
+        for vector_store in self.vector_stores:
+            if vector_store.get("vector_store_name") == vector_store_name:
+                return vector_store
+        return None
+
+    def pop_vector_stores_to_run(
+        self, non_default_params: Dict, tools: Optional[List[Dict]] = None
+    ) -> List[LiteLLM_ManagedVectorStore]:
+        """
+        Pops the vector stores to run
+
+        Primary function to use for vector store pre call hook
+        """
+        vector_store_ids = self.pop_vector_store_ids_to_run(
+            non_default_params=non_default_params, tools=tools
+        )
+        vector_stores_to_run: List[LiteLLM_ManagedVectorStore] = []
+        for vector_store_id in vector_store_ids:
+            for vector_store in self.vector_stores:
+                if vector_store.get("vector_store_id") == vector_store_id:
+                    vector_stores_to_run.append(vector_store)
+        return vector_stores_to_run
 
     def _get_vector_store_ids_from_tool_calls(
         self, tools: Optional[List[Dict]] = None, vector_store_ids: List[str] = []
@@ -127,6 +294,7 @@ class VectorStoreRegistry:
             litellm_managed_vector_store = LiteLLM_ManagedVectorStore(
                 vector_store_id=vector_store_id,
                 custom_llm_provider=custom_llm_provider,
+                litellm_params=vector_store_litellm_params,
                 vector_store_name=vector_store_name,
                 vector_store_description=vector_store_litellm_params.get(
                     "vector_store_description"
@@ -169,8 +337,8 @@ class VectorStoreRegistry:
         Only add the vector store if it is not already in the registry
         """
         vector_store_id = vector_store.get("vector_store_id")
-        for vector_store in self.vector_stores:
-            if vector_store.get("vector_store_id") == vector_store_id:
+        for _vector_store in self.vector_stores:
+            if _vector_store.get("vector_store_id") == vector_store_id:
                 return
         self.vector_stores.append(vector_store)
 
@@ -183,6 +351,16 @@ class VectorStoreRegistry:
             for vector_store in self.vector_stores
             if vector_store.get("vector_store_id") != vector_store_id
         ]
+
+    def update_vector_store_in_registry(
+        self, vector_store_id: str, updated_data: LiteLLM_ManagedVectorStore
+    ):
+        """Update or add a vector store in the registry"""
+        for i, vector_store in enumerate(self.vector_stores):
+            if vector_store.get("vector_store_id") == vector_store_id:
+                self.vector_stores[i] = updated_data
+                return
+        self.vector_stores.append(updated_data)
 
     #########################################################
     ########### DB management helpers for vector stores ###########
@@ -209,3 +387,18 @@ class VectorStoreRegistry:
                 )
                 vector_stores_from_db.append(_litellm_managed_vector_store)
         return vector_stores_from_db
+
+    def get_credentials_for_vector_store(self, vector_store_id: str) -> Dict[str, Any]:
+        """
+        Get the credentials for a vector store
+
+        Returns a dictionary of unpacked credentials for the vector store to use for the request
+        """
+        from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
+
+        for vector_store in self.vector_stores:
+            if vector_store.get("vector_store_id") == vector_store_id:
+                credentials = vector_store.get("litellm_credential_name")
+                if credentials:
+                    return CredentialAccessor.get_credential_values(credentials)
+        return {}

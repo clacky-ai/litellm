@@ -77,6 +77,7 @@ def test_map_response_format():
     }
 
 
+@pytest.mark.skip(reason="fireworks is having an active outage")
 class TestFireworksAIChatCompletion(BaseLLMChatTest):
     def get_base_completion_call_args(self) -> dict:
         return {
@@ -87,18 +88,12 @@ class TestFireworksAIChatCompletion(BaseLLMChatTest):
         """Test that tool calls with no arguments is translated correctly. Relevant issue: https://github.com/BerriAI/litellm/issues/6833"""
         pass
 
-    def test_multilingual_requests(self):
-        """
-        Fireworks AI raises a 500 BadRequest error when the request contains invalid utf-8 sequences.
-        """
-        pass
-
 
 class TestFireworksAIAudioTranscription(BaseLLMAudioTranscriptionTest):
     def get_base_audio_transcription_call_args(self) -> dict:
         return {
             "model": "fireworks_ai/whisper-v3",
-            "api_base": "https://audio-prod.us-virginia-1.direct.fireworks.ai/v1",
+            "api_base": "https://audio-prod.api.fireworks.ai/v1",
         }
 
     def get_custom_llm_provider(self) -> litellm.LlmProviders:

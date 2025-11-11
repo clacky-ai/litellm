@@ -20,7 +20,11 @@ import litellm
 from litellm._logging import verbose_proxy_logger
 from litellm.caching.caching import DualCache
 from litellm.caching.dual_cache import LimitedSizeOrderedDict
-from litellm.constants import DEFAULT_IN_MEMORY_TTL
+from litellm.constants import (
+    DEFAULT_IN_MEMORY_TTL,
+    DEFAULT_MANAGEMENT_OBJECT_IN_MEMORY_CACHE_TTL,
+    DEFAULT_MAX_RECURSE_DEPTH,
+)
 from litellm.litellm_core_utils.get_llm_provider_logic import get_llm_provider
 from litellm.proxy._types import (
     RBAC_ROLES,
@@ -28,13 +32,17 @@ from litellm.proxy._types import (
     LiteLLM_EndUserTable,
     Litellm_EntityType,
     LiteLLM_JWTAuth,
+    LiteLLM_ObjectPermissionTable,
     LiteLLM_OrganizationMembershipTable,
     LiteLLM_OrganizationTable,
+    LiteLLM_TagTable,
+    LiteLLM_TeamMembership,
     LiteLLM_TeamTable,
     LiteLLM_TeamTableCachedObj,
     LiteLLM_UserTable,
     LiteLLMRoutes,
     LitellmUserRoles,
+    NewTeamRequest,
     ProxyErrorTypes,
     ProxyException,
     RoleBasedPermissions,
@@ -45,8 +53,10 @@ from litellm.proxy.auth.route_checks import RouteChecks
 from litellm.proxy.route_llm_request import route_request
 from litellm.proxy.utils import PrismaClient, ProxyLogging, log_db_metrics
 from litellm.router import Router
+from litellm.utils import get_utc_datetime
 
 from .auth_checks_organization import organization_role_based_access_check
+from .auth_utils import get_model_from_request
 
 if TYPE_CHECKING:
     from opentelemetry.trace import Span as _Span
@@ -88,8 +98,13 @@ async def common_checks(
     8. [OPTIONAL] If guardrails modified - is request allowed to change this
     9. Check if request body is safe
     10. [OPTIONAL] Organization checks - is user_object.organization_id is set, run these checks
+    11. [OPTIONAL] Vector store checks - is the object allowed to access the vector store
     """
-    _model: Optional[str] = cast(Optional[str], request_body.get("model", None))
+    from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
+
+    _model: Optional[Union[str, List[str]]] = get_model_from_request(
+        request_body, route
+    )
 
     # 1. If team is blocked
     if team_object is not None and team_object.blocked is True:
@@ -99,7 +114,7 @@ async def common_checks(
 
     # 2. If team can call model
     if _model and team_object:
-        if not await can_team_access_model(
+        if not can_team_access_model(
             model=_model,
             team_object=team_object,
             llm_router=llm_router,
@@ -123,6 +138,14 @@ async def common_checks(
     # 3. If team is in budget
     await _team_max_budget_check(
         team_object=team_object,
+        proxy_logging_obj=proxy_logging_obj,
+        valid_token=valid_token,
+    )
+
+    await _tag_max_budget_check(
+        request_body=request_body,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
         valid_token=valid_token,
     )
@@ -211,6 +234,13 @@ async def common_checks(
         valid_token=valid_token,
     )
 
+    # 11. [OPTIONAL] Vector store checks - is the object allowed to access the vector store
+    await vector_store_access_check(
+        request_body=request_body,
+        team_object=team_object,
+        valid_token=valid_token,
+    )
+
     return True
 
 
@@ -270,11 +300,6 @@ def _is_api_route_allowed(
 
     if valid_token is None:
         raise Exception("Invalid proxy server token passed. valid_token=None.")
-
-    # Check if Virtual Key is allowed to call the route - Applies to all Roles
-    RouteChecks.is_virtual_key_allowed_to_call_route(
-        route=route, valid_token=valid_token
-    )
 
     if not _is_user_proxy_admin(user_obj=user_obj):  # if non-admin
         RouteChecks.non_proxy_admin_allowed_routes_check(
@@ -425,6 +450,7 @@ async def get_end_user_object(
     end_user_id: Optional[str],
     prisma_client: Optional[PrismaClient],
     user_api_key_cache: DualCache,
+    route: str,
     parent_otel_span: Optional[Span] = None,
     proxy_logging_obj: Optional[ProxyLogging] = None,
 ) -> Optional[LiteLLM_EndUserTable]:
@@ -441,6 +467,8 @@ async def get_end_user_object(
     _key = "end_user_id:{}".format(end_user_id)
 
     def check_in_budget(end_user_obj: LiteLLM_EndUserTable):
+        if route in LiteLLMRoutes.info_routes.value:  # allow calling info routes
+            return
         if end_user_obj.litellm_budget_table is None:
             return
         end_user_budget = end_user_obj.litellm_budget_table.max_budget
@@ -452,14 +480,10 @@ async def get_end_user_object(
     # check if in cache
     cached_user_obj = await user_api_key_cache.async_get_cache(key=_key)
     if cached_user_obj is not None:
-        if isinstance(cached_user_obj, dict):
-            return_obj = LiteLLM_EndUserTable(**cached_user_obj)
-            check_in_budget(end_user_obj=return_obj)
-            return return_obj
-        elif isinstance(cached_user_obj, LiteLLM_EndUserTable):
-            return_obj = cached_user_obj
-            check_in_budget(end_user_obj=return_obj)
-            return return_obj
+        return_obj = LiteLLM_EndUserTable(**cached_user_obj)
+        check_in_budget(end_user_obj=return_obj)
+        return return_obj
+
     # else, check db
     try:
         response = await prisma_client.db.litellm_endusertable.find_unique(
@@ -470,9 +494,9 @@ async def get_end_user_object(
         if response is None:
             raise Exception
 
-        # save the end-user object to cache
+        # save the end-user object to cache (always store as dict for consistency)
         await user_api_key_cache.async_set_cache(
-            key="end_user_id:{}".format(end_user_id), value=response
+            key="end_user_id:{}".format(end_user_id), value=response.dict()
         )
 
         _response = LiteLLM_EndUserTable(**response.dict())
@@ -483,6 +507,167 @@ async def get_end_user_object(
     except Exception as e:  # if end-user not in db
         if isinstance(e, litellm.BudgetExceededError):
             raise e
+        return None
+
+
+@log_db_metrics
+async def get_tag_objects_batch(
+    tag_names: List[str],
+    prisma_client: Optional[PrismaClient],
+    user_api_key_cache: DualCache,
+    parent_otel_span: Optional[Span] = None,
+    proxy_logging_obj: Optional[ProxyLogging] = None,
+) -> Dict[str, LiteLLM_TagTable]:
+    """
+    Batch fetch multiple tag objects from cache and db.
+
+    Optimizes for latency by:
+    1. Fetching all cached tags in parallel
+    2. Batch fetching uncached tags in one DB query
+
+    Args:
+        tag_names: List of tag names to fetch
+        prisma_client: Prisma database client
+        user_api_key_cache: Cache for storing tag objects
+        parent_otel_span: Optional OpenTelemetry span for tracing
+        proxy_logging_obj: Optional proxy logging object
+
+    Returns:
+        Dictionary mapping tag_name to LiteLLM_TagTable object
+    """
+    if prisma_client is None:
+        return {}
+
+    if not tag_names:
+        return {}
+
+    tag_objects = {}
+    uncached_tags = []
+
+    # Try to get all tags from cache first
+    for tag_name in tag_names:
+        cache_key = f"tag:{tag_name}"
+        cached_tag = await user_api_key_cache.async_get_cache(key=cache_key)
+        if cached_tag is not None:
+            if isinstance(cached_tag, dict):
+                tag_objects[tag_name] = LiteLLM_TagTable(**cached_tag)
+            else:
+                tag_objects[tag_name] = cached_tag
+        else:
+            uncached_tags.append(tag_name)
+
+    # Batch fetch uncached tags from DB in one query
+    if uncached_tags:
+        try:
+            db_tags = await prisma_client.db.litellm_tagtable.find_many(
+                where={"tag_name": {"in": uncached_tags}},
+                include={"litellm_budget_table": True},
+            )
+
+            # Cache and add to tag_objects
+            for db_tag in db_tags:
+                tag_name = db_tag.tag_name
+                cache_key = f"tag:{tag_name}"
+                # Cache with default TTL (same as end_user objects)
+                await user_api_key_cache.async_set_cache(
+                    key=cache_key, value=db_tag.dict()
+                )
+                tag_objects[tag_name] = LiteLLM_TagTable(**db_tag.dict())
+        except Exception as e:
+            verbose_proxy_logger.debug(f"Error batch fetching tags from database: {e}")
+
+    return tag_objects
+
+
+@log_db_metrics
+async def get_tag_object(
+    tag_name: Optional[str],
+    prisma_client: Optional[PrismaClient],
+    user_api_key_cache: DualCache,
+    parent_otel_span: Optional[Span] = None,
+    proxy_logging_obj: Optional[ProxyLogging] = None,
+) -> Optional[LiteLLM_TagTable]:
+    """
+    Returns tag object from cache or db.
+
+    Uses default cache TTL (same as end_user objects) to avoid drift.
+
+    Args:
+        tag_name: Name of the tag to fetch
+        prisma_client: Prisma database client
+        user_api_key_cache: Cache for storing tag objects
+        parent_otel_span: Optional OpenTelemetry span for tracing
+        proxy_logging_obj: Optional proxy logging object
+
+    Returns:
+        LiteLLM_TagTable object if found, None otherwise
+    """
+    if prisma_client is None or tag_name is None:
+        return None
+
+    # Use batch helper for consistency
+    tag_objects = await get_tag_objects_batch(
+        tag_names=[tag_name],
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+        parent_otel_span=parent_otel_span,
+        proxy_logging_obj=proxy_logging_obj,
+    )
+
+    return tag_objects.get(tag_name)
+
+
+@log_db_metrics
+async def get_team_membership(
+    user_id: str,
+    team_id: str,
+    prisma_client: Optional[PrismaClient],
+    user_api_key_cache: DualCache,
+    parent_otel_span: Optional[Span] = None,
+    proxy_logging_obj: Optional[ProxyLogging] = None,
+) -> Optional["LiteLLM_TeamMembership"]:
+    """
+    Returns team membership object if user is member of team.
+
+    Do a isolated check for team membership vs. doing a combined key + team + user + team-membership check, as key might come in frequently for different users/teams. Larger call will slowdown query time. This way we get to cache the constant (key/team/user info) and only update based on the changing value (team membership).
+    """
+    from litellm.proxy._types import LiteLLM_TeamMembership
+
+    if prisma_client is None:
+        raise Exception("No db connected")
+
+    if user_id is None or team_id is None:
+        return None
+
+    _key = "team_membership:{}:{}".format(user_id, team_id)
+
+    # check if in cache
+    cached_membership_obj = await user_api_key_cache.async_get_cache(key=_key)
+    if cached_membership_obj is not None:
+        return LiteLLM_TeamMembership(**cached_membership_obj)
+
+    # else, check db
+    try:
+        response = await prisma_client.db.litellm_teammembership.find_unique(
+            where={"user_id_team_id": {"user_id": user_id, "team_id": team_id}},
+            include={"litellm_budget_table": True},
+        )
+
+        if response is None:
+            return None
+
+        # save the team membership object to cache (store as dict)
+        await user_api_key_cache.async_set_cache(key=_key, value=response.dict())
+
+        _response = LiteLLM_TeamMembership(**response.dict())
+
+        return _response
+    except Exception:
+        verbose_proxy_logger.exception(
+            "Error getting team membership for user_id: %s, team_id: %s",
+            user_id,
+            team_id,
+        )
         return None
 
 
@@ -693,8 +878,14 @@ async def get_user_object(
 
         if response is None:
             if user_id_upsert:
+                new_user_params: Dict[str, Any] = {
+                    "user_id": user_id,
+                }
+                if litellm.default_internal_user_params is not None:
+                    new_user_params.update(litellm.default_internal_user_params)
+
                 response = await prisma_client.db.litellm_usertable.create(
-                    data={"user_id": user_id},
+                    data=new_user_params,
                     include={"organization_memberships": True},
                 )
             else:
@@ -716,7 +907,11 @@ async def get_user_object(
         response_dict = _response.model_dump()
 
         # save the user object to cache
-        await user_api_key_cache.async_set_cache(key=user_id, value=response_dict)
+        await user_api_key_cache.async_set_cache(
+            key=user_id,
+            value=response_dict,
+            ttl=DEFAULT_MANAGEMENT_OBJECT_IN_MEMORY_CACHE_TTL,
+        )
 
         # save to db access time
         _update_last_db_access_time(
@@ -738,7 +933,12 @@ async def _cache_management_object(
     user_api_key_cache: DualCache,
     proxy_logging_obj: Optional[ProxyLogging],
 ):
-    await user_api_key_cache.async_set_cache(key=key, value=value)
+
+    await user_api_key_cache.async_set_cache(
+        key=key,
+        value=value,
+        ttl=DEFAULT_MANAGEMENT_OBJECT_IN_MEMORY_CACHE_TTL,
+    )
 
 
 async def _cache_team_object(
@@ -804,10 +1004,19 @@ async def _get_team_db_check(
     )
 
     if response is None and team_id_upsert:
-        response = await prisma_client.db.litellm_teamtable.create(
-            data={"team_id": team_id}
-        )
+        from litellm.proxy.management_endpoints.team_endpoints import new_team
 
+        new_team_data = NewTeamRequest(team_id=team_id)
+
+        mock_request = Request(scope={"type": "http"})
+        system_admin_user = UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN)
+
+        created_team_dict = await new_team(
+            data=new_team_data,
+            http_request=mock_request,
+            user_api_key_dict=system_admin_user,
+        )
+        response = LiteLLM_TeamTable(**created_team_dict)
     return response
 
 
@@ -852,7 +1061,6 @@ async def _get_team_object_from_user_api_key_cache(
         proxy_logging_obj=proxy_logging_obj,
     )
 
-    # save to db access time
     # save to db access time
     _update_last_db_access_time(
         key=db_access_time_key,
@@ -957,7 +1165,7 @@ async def get_team_object(
 class ExperimentalUIJWTToken:
     @staticmethod
     def get_experimental_ui_login_jwt_auth_token(user_info: LiteLLM_UserTable) -> str:
-        from datetime import UTC, datetime, timedelta
+        from datetime import timedelta
 
         from litellm.proxy.common_utils.encrypt_decrypt_utils import (
             encrypt_value_helper,
@@ -967,7 +1175,7 @@ class ExperimentalUIJWTToken:
             raise Exception("User role is required for experimental UI login")
 
         # Calculate expiration time (10 minutes from now)
-        expiration_time = datetime.now(UTC) + timedelta(minutes=10)
+        expiration_time = get_utc_datetime() + timedelta(minutes=10)
 
         # Format the expiration time as ISO 8601 string
         expires = expiration_time.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "+00:00"
@@ -999,7 +1207,9 @@ class ExperimentalUIJWTToken:
             decrypt_value_helper,
         )
 
-        decrypted_token = decrypt_value_helper(hashed_token, exception_type="debug")
+        decrypted_token = decrypt_value_helper(
+            hashed_token, key="ui_hash_key", exception_type="debug"
+        )
         if decrypted_token is None:
             return None
         try:
@@ -1079,6 +1289,54 @@ async def get_key_object(
 
 
 @log_db_metrics
+async def get_object_permission(
+    object_permission_id: str,
+    prisma_client: Optional[PrismaClient],
+    user_api_key_cache: DualCache,
+    parent_otel_span: Optional[Span] = None,
+    proxy_logging_obj: Optional[ProxyLogging] = None,
+) -> Optional[LiteLLM_ObjectPermissionTable]:
+    """
+    - Check if object permission id in proxy ObjectPermissionTable
+    - if valid, return LiteLLM_ObjectPermissionTable object
+    - if not, then raise an error
+    """
+    if prisma_client is None:
+        raise Exception(
+            "No DB Connected. See - https://docs.litellm.ai/docs/proxy/virtual_keys"
+        )
+
+    # check if in cache
+    key = "object_permission_id:{}".format(object_permission_id)
+    cached_obj_permission = await user_api_key_cache.async_get_cache(key=key)
+    if cached_obj_permission is not None:
+        if isinstance(cached_obj_permission, dict):
+            return LiteLLM_ObjectPermissionTable(**cached_obj_permission)
+        elif isinstance(cached_obj_permission, LiteLLM_ObjectPermissionTable):
+            return cached_obj_permission
+
+    # else, check db
+    try:
+        response = await prisma_client.db.litellm_objectpermissiontable.find_unique(
+            where={"object_permission_id": object_permission_id}
+        )
+
+        if response is None:
+            return None
+
+        # save the object permission to cache
+        await user_api_key_cache.async_set_cache(
+            key=key,
+            value=response.model_dump(),
+            ttl=DEFAULT_MANAGEMENT_OBJECT_IN_MEMORY_CACHE_TTL,
+        )
+
+        return LiteLLM_ObjectPermissionTable(**response.dict())
+    except Exception:
+        return None
+
+
+@log_db_metrics
 async def get_org_object(
     org_id: str,
     prisma_client: Optional[PrismaClient],
@@ -1095,6 +1353,8 @@ async def get_org_object(
         raise Exception(
             "No DB Connected. See - https://docs.litellm.ai/docs/proxy/virtual_keys"
         )
+    if not isinstance(org_id, str):
+        return None
 
     # check if in cache
     cached_org_obj = user_api_key_cache.async_get_cache(key="org_id:{}".format(org_id))
@@ -1119,39 +1379,23 @@ async def get_org_object(
         )
 
 
-def _can_object_call_model(
+def _check_model_access_helper(
     model: str,
     llm_router: Optional[Router],
     models: List[str],
     team_model_aliases: Optional[Dict[str, str]] = None,
-    object_type: Literal["user", "team", "key", "org"] = "user",
-) -> Literal[True]:
-    """
-    Checks if token can call a given model
-
-    Args:
-        - model: str
-        - llm_router: Optional[Router]
-        - models: List[str]
-        - team_model_aliases: Optional[Dict[str, str]]
-        - object_type: Literal["user", "team", "key", "org"]. We use the object type to raise the correct exception type
-
-    Returns:
-        - True: if token allowed to call model
-
-    Raises:
-        - Exception: If token not allowed to call model
-    """
-    if model in litellm.model_alias_map:
-        model = litellm.model_alias_map[model]
-
+    team_id: Optional[str] = None,
+) -> bool:
     ## check if model in allowed model names
     from collections import defaultdict
 
     access_groups: Dict[str, List[str]] = defaultdict(list)
 
     if llm_router:
-        access_groups = llm_router.get_model_access_groups(model_name=model)
+        access_groups = llm_router.get_model_access_groups(
+            model_name=model, team_id=team_id
+        )
+
     if (
         len(access_groups) > 0 and llm_router is not None
     ):  # check if token contains any model access groups
@@ -1163,8 +1407,6 @@ def _can_object_call_model(
 
     # Filter out models that are access_groups
     filtered_models = [m for m in models if m not in access_groups]
-
-    verbose_proxy_logger.debug(f"model: {model}; allowed_models: {filtered_models}")
 
     if _model_in_team_aliases(model=model, team_model_aliases=team_model_aliases):
         return True
@@ -1183,19 +1425,81 @@ def _can_object_call_model(
         all_model_access = True
 
     if model is not None and model not in filtered_models and all_model_access is False:
-        raise ProxyException(
-            message=f"{object_type} not allowed to access model. This {object_type} can only access models={models}. Tried to access {model}",
-            type=ProxyErrorTypes.get_model_access_error_type_for_object(
-                object_type=object_type
-            ),
-            param="model",
-            code=status.HTTP_401_UNAUTHORIZED,
-        )
-
-    verbose_proxy_logger.debug(
-        f"filtered allowed_models: {filtered_models}; models: {models}"
-    )
+        return False
     return True
+
+
+def _can_object_call_model(
+    model: Union[str, List[str]],
+    llm_router: Optional[Router],
+    models: List[str],
+    team_model_aliases: Optional[Dict[str, str]] = None,
+    team_id: Optional[str] = None,
+    object_type: Literal["user", "team", "key", "org"] = "user",
+    fallback_depth: int = 0,
+) -> Literal[True]:
+    """
+    Checks if token can call a given model
+
+    Args:
+        - model: str
+        - llm_router: Optional[Router]
+        - models: List[str]
+        - team_model_aliases: Optional[Dict[str, str]]
+        - object_type: Literal["user", "team", "key", "org"]. We use the object type to raise the correct exception type
+
+    Returns:
+        - True: if token allowed to call model
+
+    Raises:
+        - Exception: If token not allowed to call model
+    """
+    if fallback_depth >= DEFAULT_MAX_RECURSE_DEPTH:
+        raise Exception(
+            "Unable to parse model, max fallback depth exceeded - received model: {}".format(
+                model
+            )
+        )
+    if isinstance(model, list):
+        for m in model:
+            _can_object_call_model(
+                model=m,
+                llm_router=llm_router,
+                models=models,
+                team_model_aliases=team_model_aliases,
+                team_id=team_id,
+                object_type=object_type,
+                fallback_depth=fallback_depth + 1,
+            )
+        return True
+
+    potential_models = [model]
+    if model in litellm.model_alias_map:
+        potential_models.append(litellm.model_alias_map[model])
+    elif llm_router and model in llm_router.model_group_alias:
+        _model = llm_router._get_model_from_alias(model)
+        if _model:
+            potential_models.append(_model)
+
+    ## check model access for alias + underlying model - allow if either is in allowed models
+    for m in potential_models:
+        if _check_model_access_helper(
+            model=m,
+            llm_router=llm_router,
+            models=models,
+            team_model_aliases=team_model_aliases,
+            team_id=team_id,
+        ):
+            return True
+
+    raise ProxyException(
+        message=f"{object_type} not allowed to access model. This {object_type} can only access models={models}. Tried to access {model}",
+        type=ProxyErrorTypes.get_model_access_error_type_for_object(
+            object_type=object_type
+        ),
+        param="model",
+        code=status.HTTP_401_UNAUTHORIZED,
+    )
 
 
 def _model_in_team_aliases(
@@ -1219,7 +1523,7 @@ def _model_in_team_aliases(
 
 
 async def can_key_call_model(
-    model: str,
+    model: Union[str, List[str]],
     llm_model_list: Optional[list],
     valid_token: UserAPIKeyAuth,
     llm_router: Optional[litellm.Router],
@@ -1238,6 +1542,7 @@ async def can_key_call_model(
         llm_router=llm_router,
         models=valid_token.models,
         team_model_aliases=valid_token.team_model_aliases,
+        team_id=valid_token.team_id,
         object_type="key",
     )
 
@@ -1261,8 +1566,8 @@ def can_org_access_model(
     )
 
 
-async def can_team_access_model(
-    model: str,
+def can_team_access_model(
+    model: Union[str, List[str]],
     team_object: Optional[LiteLLM_TeamTable],
     llm_router: Optional[Router],
     team_model_aliases: Optional[Dict[str, str]] = None,
@@ -1276,12 +1581,13 @@ async def can_team_access_model(
         llm_router=llm_router,
         models=team_object.models if team_object else [],
         team_model_aliases=team_model_aliases,
+        team_id=team_object.team_id if team_object else None,
         object_type="team",
     )
 
 
 async def can_user_call_model(
-    model: str,
+    model: Union[str, List[str]],
     llm_router: Optional[Router],
     user_object: Optional[LiteLLM_UserTable],
 ) -> Literal[True]:
@@ -1456,6 +1762,58 @@ async def _team_max_budget_check(
         )
 
 
+async def _tag_max_budget_check(
+    request_body: dict,
+    prisma_client: Optional[PrismaClient],
+    user_api_key_cache: DualCache,
+    proxy_logging_obj: ProxyLogging,
+    valid_token: Optional[UserAPIKeyAuth],
+):
+    """
+    Check if any tags in the request are over their max budget.
+
+    Raises:
+        BudgetExceededError if any tag is over its max budget.
+        Triggers a budget alert if any tag is over its max budget.
+    """
+    from litellm.proxy.common_utils.http_parsing_utils import get_tags_from_request_body
+
+    if prisma_client is None:
+        return
+
+    # Get tags from request metadata
+    tags = get_tags_from_request_body(request_body=request_body)
+    if not tags:
+        return
+
+    # Batch fetch all tags in one go
+    tag_objects = await get_tag_objects_batch(
+        tag_names=tags,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+        proxy_logging_obj=proxy_logging_obj,
+    )
+
+    # Check budget for each tag
+    for tag_name in tags:
+        tag_object = tag_objects.get(tag_name)
+        if tag_object is None:
+            continue
+
+        # Check if tag has budget limits
+        if (
+            tag_object.litellm_budget_table is not None
+            and tag_object.litellm_budget_table.max_budget is not None
+            and tag_object.spend is not None
+            and tag_object.spend > tag_object.litellm_budget_table.max_budget
+        ):
+            raise litellm.BudgetExceededError(
+                current_cost=tag_object.spend,
+                max_budget=tag_object.litellm_budget_table.max_budget,
+                message=f"Budget has been exceeded! Tag={tag_name} Current cost: {tag_object.spend}, Max budget: {tag_object.litellm_budget_table.max_budget}",
+            )
+
+
 def is_model_allowed_by_pattern(model: str, allowed_model_pattern: str) -> bool:
     """
     Check if a model matches an allowed pattern.
@@ -1538,3 +1896,104 @@ def _is_wildcard_pattern(allowed_model_pattern: str) -> bool:
     Checks if `*` is in the pattern.
     """
     return "*" in allowed_model_pattern
+
+
+async def vector_store_access_check(
+    request_body: dict,
+    team_object: Optional[LiteLLM_TeamTable],
+    valid_token: Optional[UserAPIKeyAuth],
+):
+    """
+    Checks if the object (key, team, org) has access to the vector store.
+
+    Raises ProxyException if the object (key, team, org) cannot access the specific vector store.
+    """
+    from litellm.proxy.proxy_server import prisma_client
+
+    #########################################################
+    # Get the vector store the user is trying to access
+    #########################################################
+    if prisma_client is None:
+        verbose_proxy_logger.debug(
+            "Prisma client not found, skipping vector store access check"
+        )
+        return True
+
+    if litellm.vector_store_registry is None:
+        verbose_proxy_logger.debug(
+            "Vector store registry not found, skipping vector store access check"
+        )
+        return True
+
+    vector_store_ids_to_run = litellm.vector_store_registry.get_vector_store_ids_to_run(
+        non_default_params=request_body, tools=request_body.get("tools", None)
+    )
+    if vector_store_ids_to_run is None:
+        verbose_proxy_logger.debug(
+            "Vector store to run not found, skipping vector store access check"
+        )
+        return True
+
+    #########################################################
+    # Check if the object (key, team, org) has access to the vector store
+    #########################################################
+    # Check if the key can access the vector store
+    if valid_token is not None and valid_token.object_permission_id is not None:
+        key_object_permission = (
+            await prisma_client.db.litellm_objectpermissiontable.find_unique(
+                where={"object_permission_id": valid_token.object_permission_id},
+            )
+        )
+        if key_object_permission is not None:
+            _can_object_call_vector_stores(
+                object_type="key",
+                vector_store_ids_to_run=vector_store_ids_to_run,
+                object_permissions=key_object_permission,
+            )
+
+    # Check if the team can access the vector store
+    if team_object is not None and team_object.object_permission_id is not None:
+        team_object_permission = (
+            await prisma_client.db.litellm_objectpermissiontable.find_unique(
+                where={"object_permission_id": team_object.object_permission_id},
+            )
+        )
+        if team_object_permission is not None:
+            _can_object_call_vector_stores(
+                object_type="team",
+                vector_store_ids_to_run=vector_store_ids_to_run,
+                object_permissions=team_object_permission,
+            )
+    return True
+
+
+def _can_object_call_vector_stores(
+    object_type: Literal["key", "team", "org"],
+    vector_store_ids_to_run: List[str],
+    object_permissions: Optional[LiteLLM_ObjectPermissionTable],
+):
+    """
+    Raises ProxyException if the object (key, team, org) cannot access the specific vector store.
+    """
+    if object_permissions is None:
+        return True
+
+    if object_permissions.vector_stores is None:
+        return True
+
+    # If length is 0, then the object has access to all vector stores.
+    if len(object_permissions.vector_stores) == 0:
+        return True
+
+    for vector_store_id in vector_store_ids_to_run:
+        if vector_store_id not in object_permissions.vector_stores:
+            raise ProxyException(
+                message=f"User not allowed to access vector store. Tried to access {vector_store_id}. Only allowed to access {object_permissions.vector_stores}",
+                type=ProxyErrorTypes.get_vector_store_access_error_type_for_object(
+                    object_type
+                ),
+                param="vector_store",
+                code=status.HTTP_401_UNAUTHORIZED,
+            )
+
+    return True

@@ -3,21 +3,15 @@ TODO: DELETE FILE. Bedrock LLM is no longer used. Goto `litellm/llms/bedrock/cha
 """
 
 import copy
-import json
 import time
 import types
-import urllib.parse
-import uuid
 from functools import partial
 from typing import (
-    Any,
     AsyncIterator,
     Callable,
     Iterator,
-    List,
     Optional,
     Tuple,
-    Union,
     cast,
     get_args,
 )
@@ -26,6 +20,7 @@ import httpx  # type: ignore
 
 import litellm
 from litellm import verbose_logger
+from litellm._uuid import uuid
 from litellm.caching.caching import InMemoryCache
 from litellm.litellm_core_utils.core_helpers import map_finish_reason
 from litellm.litellm_core_utils.litellm_logging import Logging
@@ -272,6 +267,7 @@ def make_sync_call(
     api_base: str,
     headers: dict,
     data: str,
+    signed_json_body: Optional[bytes],
     model: str,
     messages: list,
     logging_obj: Logging,
@@ -286,7 +282,7 @@ def make_sync_call(
         response = client.post(
             api_base,
             headers=headers,
-            data=data,
+            data=signed_json_body if signed_json_body is not None else data,
             stream=not fake_stream,
             logging_obj=logging_obj,
         )
@@ -497,9 +493,9 @@ class BedrockLLM(BaseAWSLLM):
                             content=None,
                         )
                         model_response.choices[0].message = _message  # type: ignore
-                        model_response._hidden_params[
-                            "original_response"
-                        ] = outputText  # allow user to access raw anthropic tool calling response
+                        model_response._hidden_params["original_response"] = (
+                            outputText  # allow user to access raw anthropic tool calling response
+                        )
                     if (
                         _is_function_call is True
                         and stream is not None
@@ -671,16 +667,6 @@ class BedrockLLM(BaseAWSLLM):
 
         return model_response
 
-    def encode_model_id(self, model_id: str) -> str:
-        """
-        Double encode the model ID to ensure it matches the expected double-encoded format.
-        Args:
-            model_id (str): The model ID to encode.
-        Returns:
-            str: The double-encoded model ID.
-        """
-        return urllib.parse.quote(model_id, safe="")
-
     def completion(  # noqa: PLR0915
         self,
         model: str,
@@ -807,9 +793,9 @@ class BedrockLLM(BaseAWSLLM):
                     ):  # completion(top_k=3) > anthropic_config(top_k=3) <- allows for dynamic variables to be passed in
                         inference_params[k] = v
                 if stream is True:
-                    inference_params[
-                        "stream"
-                    ] = True  # cohere requires stream = True in inference params
+                    inference_params["stream"] = (
+                        True  # cohere requires stream = True in inference params
+                    )
                 data = json.dumps({"prompt": prompt, **inference_params})
         elif provider == "anthropic":
             if model.startswith("anthropic.claude-3"):
@@ -830,7 +816,7 @@ class BedrockLLM(BaseAWSLLM):
                     model=model, messages=messages, custom_llm_provider="anthropic_xml"
                 )  # type: ignore
                 ## LOAD CONFIG
-                config = litellm.AmazonAnthropicClaude3Config.get_config()
+                config = litellm.AmazonAnthropicClaudeConfig.get_config()
                 for k, v in config.items():
                     if (
                         k not in inference_params
@@ -1175,33 +1161,6 @@ class BedrockLLM(BaseAWSLLM):
                 return cast(litellm.BEDROCK_INVOKE_PROVIDERS_LITERAL, provider)
         return None
 
-    def get_bedrock_model_id(
-        self,
-        optional_params: dict,
-        provider: Optional[litellm.BEDROCK_INVOKE_PROVIDERS_LITERAL],
-        model: str,
-    ) -> str:
-        modelId = optional_params.pop("model_id", None)
-        if modelId is not None:
-            modelId = self.encode_model_id(model_id=modelId)
-        else:
-            modelId = model
-
-        if provider == "llama" and "llama/" in modelId:
-            modelId = self._get_model_id_for_llama_like_model(modelId)
-
-        return modelId
-
-    def _get_model_id_for_llama_like_model(
-        self,
-        model: str,
-    ) -> str:
-        """
-        Remove `llama` from modelID since `llama` is simply a spec to follow for custom bedrock models
-        """
-        model_id = model.replace("llama/", "")
-        return self.encode_model_id(model_id=model_id)
-
 
 def get_response_stream_shape():
     global _response_stream_shape_cache
@@ -1224,6 +1183,7 @@ class AWSEventStreamDecoder:
         self.model = model
         self.parser = EventStreamJSONParser()
         self.content_blocks: List[ContentBlockDeltaEvent] = []
+        self.tool_calls_index: Optional[int] = None
 
     def check_empty_tool_call_args(self) -> bool:
         """
@@ -1313,6 +1273,11 @@ class AWSEventStreamDecoder:
                         response_tool_name = get_bedrock_tool_name(
                             response_tool_name=_response_tool_name
                         )
+                        self.tool_calls_index = (
+                            0
+                            if self.tool_calls_index is None
+                            else self.tool_calls_index + 1
+                        )
                         tool_use = {
                             "id": start_obj["toolUse"]["toolUseId"],
                             "type": "function",
@@ -1320,7 +1285,7 @@ class AWSEventStreamDecoder:
                                 "name": response_tool_name,
                                 "arguments": "",
                             },
-                            "index": index,
+                            "index": self.tool_calls_index,
                         }
                     elif (
                         "reasoningContent" in start_obj
@@ -1345,7 +1310,11 @@ class AWSEventStreamDecoder:
                             "name": None,
                             "arguments": delta_obj["toolUse"]["input"],
                         },
-                        "index": index,
+                        "index": (
+                            self.tool_calls_index
+                            if self.tool_calls_index is not None
+                            else index
+                        ),
                     }
                 elif "reasoningContent" in delta_obj:
                     provider_specific_fields = {
@@ -1375,7 +1344,11 @@ class AWSEventStreamDecoder:
                             "name": None,
                             "arguments": "{}",
                         },
-                        "index": chunk_data["contentBlockIndex"],
+                        "index": (
+                            self.tool_calls_index
+                            if self.tool_calls_index is not None
+                            else index
+                        ),
                     }
             elif "stopReason" in chunk_data:
                 finish_reason = map_finish_reason(chunk_data.get("stopReason", "stop"))
@@ -1413,7 +1386,9 @@ class AWSEventStreamDecoder:
         except Exception as e:
             raise Exception("Received streaming error - {}".format(str(e)))
 
-    def _chunk_parser(self, chunk_data: dict) -> Union[GChunk, ModelResponseStream]:
+    def _chunk_parser(
+        self, chunk_data: dict
+    ) -> Union[GChunk, ModelResponseStream, dict]:
         text = ""
         is_finished = False
         finish_reason = ""
@@ -1435,7 +1410,7 @@ class AWSEventStreamDecoder:
         ######### /bedrock/invoke nova mappings ###############
         elif "contentBlockDelta" in chunk_data:
             # when using /bedrock/invoke/nova, the chunk_data is nested under "contentBlockDelta"
-            _chunk_data = chunk_data.get("contentBlockDelta", None)
+            _chunk_data = chunk_data.get("contentBlockDelta", {})
             return self.converse_chunk_parser(chunk_data=_chunk_data)
         ######## bedrock.mistral mappings ###############
         elif "outputs" in chunk_data:
@@ -1473,7 +1448,7 @@ class AWSEventStreamDecoder:
 
     def iter_bytes(
         self, iterator: Iterator[bytes]
-    ) -> Iterator[Union[GChunk, ModelResponseStream]]:
+    ) -> Iterator[Union[GChunk, ModelResponseStream, dict]]:
         """Given an iterator that yields lines, iterate over it & yield every event encountered"""
         from botocore.eventstream import EventStreamBuffer
 
@@ -1489,7 +1464,7 @@ class AWSEventStreamDecoder:
 
     async def aiter_bytes(
         self, iterator: AsyncIterator[bytes]
-    ) -> AsyncIterator[Union[GChunk, ModelResponseStream]]:
+    ) -> AsyncIterator[Union[GChunk, ModelResponseStream, dict]]:
         """Given an async iterator that yields lines, iterate over it & yield every event encountered"""
         from botocore.eventstream import EventStreamBuffer
 
@@ -1576,7 +1551,9 @@ class AmazonDeepSeekR1StreamDecoder(AWSEventStreamDecoder):
             sync_stream=sync_stream,
         )
 
-    def _chunk_parser(self, chunk_data: dict) -> Union[GChunk, ModelResponseStream]:
+    def _chunk_parser(
+        self, chunk_data: dict
+    ) -> Union[GChunk, ModelResponseStream, dict]:
         return self.deepseek_model_response_iterator.chunk_parser(chunk=chunk_data)
 
 
