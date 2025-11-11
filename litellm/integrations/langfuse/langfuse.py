@@ -686,7 +686,6 @@ class LangFuseLogger:
                     # Read cache_read_input_tokens - support both legacy and new formats
                     # Legacy format (Anthropic, etc): top-level cache_read_input_tokens
                     # New format (OpenAI, OpenRouter): prompt_tokens_details.cached_tokens
-                    # add support for openrouter openai usage 
                     cache_read_input_tokens = _usage_obj.get(
                         "cache_read_input_tokens", 0
                     )
