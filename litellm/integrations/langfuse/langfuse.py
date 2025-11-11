@@ -683,23 +683,53 @@ class LangFuseLogger:
                 _usage_obj = getattr(response_obj, "usage", None)
 
                 if _usage_obj:
-                    usage = {
-                        "prompt_tokens": _usage_obj.prompt_tokens,
-                        "completion_tokens": _usage_obj.completion_tokens,
-                        "total_cost": cost if self._supports_costs() else None,
-                    }
+                    # Read cache_read_input_tokens - support both legacy and new formats
+                    # Legacy format (Anthropic, etc): top-level cache_read_input_tokens
+                    # New format (OpenAI, OpenRouter): prompt_tokens_details.cached_tokens
                     cache_read_input_tokens = _usage_obj.get(
-                            "cache_read_input_tokens", 0
+                        "cache_read_input_tokens", 0
                     )
+                    if cache_read_input_tokens == 0:
+                        # Try reading from prompt_tokens_details.cached_tokens (OpenAI format)
+                        prompt_tokens_details = _usage_obj.get("prompt_tokens_details", None)
+                        if prompt_tokens_details is not None:
+                            # Support both dict and object (PromptTokensDetailsWrapper) types
+                            if isinstance(prompt_tokens_details, dict):
+                                cache_read_input_tokens = prompt_tokens_details.get("cached_tokens", 0) or 0
+                            else:
+                                # Try to access as attribute for wrapper objects
+                                cache_read_input_tokens = getattr(prompt_tokens_details, "cached_tokens", 0) or 0
+
+                    # Read cache_creation_input_tokens - support both formats
+                    cache_creation_input_tokens = _usage_obj.get(
+                        "cache_creation_input_tokens", 0
+                    )
+                    if cache_creation_input_tokens == 0:
+                        # Try reading from prompt_tokens_details.cache_creation_tokens (OpenAI format)
+                        prompt_tokens_details = _usage_obj.get("prompt_tokens_details", None)
+                        if prompt_tokens_details is not None:
+                            # Support both dict and object (PromptTokensDetailsWrapper) types
+                            if isinstance(prompt_tokens_details, dict):
+                                cache_creation_input_tokens = prompt_tokens_details.get("cache_creation_tokens", 0) or 0
+                            else:
+                                # Try to access as attribute for wrapper objects
+                                cache_creation_input_tokens = getattr(prompt_tokens_details, "cache_creation_tokens", 0) or 0
+
+                    usage = {
+                        "input": _usage_obj.prompt_tokens - cache_read_input_tokens,
+                        "output": _usage_obj.completion_tokens,
+                        "cache_read_input_tokens": cache_read_input_tokens,
+                        "cache_creation_input_tokens": cache_creation_input_tokens,
+                    }
+
                     # According to langfuse documentation: "the input value must be reduced by the number of cache_read_input_tokens"
                     input_tokens = _usage_obj.prompt_tokens - cache_read_input_tokens
+
                     usage_details = LangfuseUsageDetails(
                         input=input_tokens,
                         output=_usage_obj.completion_tokens,
                         total=_usage_obj.total_tokens,
-                        cache_creation_input_tokens=_usage_obj.get(
-                            "cache_creation_input_tokens", 0
-                        ),
+                        cache_creation_input_tokens=cache_creation_input_tokens,
                         cache_read_input_tokens=cache_read_input_tokens,
                     )
 
