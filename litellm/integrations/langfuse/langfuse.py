@@ -686,15 +686,19 @@ class LangFuseLogger:
                     # Read cache_read_input_tokens - support both legacy and new formats
                     # Legacy format (Anthropic, etc): top-level cache_read_input_tokens
                     # New format (OpenAI, OpenRouter): prompt_tokens_details.cached_tokens
-                    # add support for openrouter openai usage 
                     cache_read_input_tokens = _usage_obj.get(
                         "cache_read_input_tokens", 0
                     )
                     if cache_read_input_tokens == 0:
                         # Try reading from prompt_tokens_details.cached_tokens (OpenAI format)
-                        prompt_tokens_details = _usage_obj.get("prompt_tokens_details", {})
-                        if isinstance(prompt_tokens_details, dict):
-                            cache_read_input_tokens = prompt_tokens_details.get("cached_tokens", 0) or 0
+                        prompt_tokens_details = _usage_obj.get("prompt_tokens_details", None)
+                        if prompt_tokens_details is not None:
+                            # Support both dict and object (PromptTokensDetailsWrapper) types
+                            if isinstance(prompt_tokens_details, dict):
+                                cache_read_input_tokens = prompt_tokens_details.get("cached_tokens", 0) or 0
+                            else:
+                                # Try to access as attribute for wrapper objects
+                                cache_read_input_tokens = getattr(prompt_tokens_details, "cached_tokens", 0) or 0
 
                     # Read cache_creation_input_tokens - support both formats
                     cache_creation_input_tokens = _usage_obj.get(
@@ -702,9 +706,14 @@ class LangFuseLogger:
                     )
                     if cache_creation_input_tokens == 0:
                         # Try reading from prompt_tokens_details.cache_creation_tokens (OpenAI format)
-                        prompt_tokens_details = _usage_obj.get("prompt_tokens_details", {})
-                        if isinstance(prompt_tokens_details, dict):
-                            cache_creation_input_tokens = prompt_tokens_details.get("cache_creation_tokens", 0) or 0
+                        prompt_tokens_details = _usage_obj.get("prompt_tokens_details", None)
+                        if prompt_tokens_details is not None:
+                            # Support both dict and object (PromptTokensDetailsWrapper) types
+                            if isinstance(prompt_tokens_details, dict):
+                                cache_creation_input_tokens = prompt_tokens_details.get("cache_creation_tokens", 0) or 0
+                            else:
+                                # Try to access as attribute for wrapper objects
+                                cache_creation_input_tokens = getattr(prompt_tokens_details, "cache_creation_tokens", 0) or 0
 
                     usage = {
                         "input": _usage_obj.prompt_tokens - cache_read_input_tokens,
